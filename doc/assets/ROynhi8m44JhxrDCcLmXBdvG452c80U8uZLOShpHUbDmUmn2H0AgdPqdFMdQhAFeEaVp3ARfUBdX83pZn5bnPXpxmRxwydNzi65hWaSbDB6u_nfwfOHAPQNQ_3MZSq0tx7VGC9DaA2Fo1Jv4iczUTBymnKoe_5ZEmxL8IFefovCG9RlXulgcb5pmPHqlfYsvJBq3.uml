@@ -1,0 +1,13 @@
+@startuml
+start
+:Copy From Host To GPU;
+:Copy To CPU From Host;
+if (record?) then (true)
+	:add  CUDA timers to log file;
+	:add  CPU timers to log file;
+else (false)
+	:print CUDA timers to screen;
+	:print CPU timers to screen;
+endif
+stop
+@enduml

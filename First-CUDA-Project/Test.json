@@ -1,0 +1,8 @@
+{
+  "duration": 4,
+  "duration-type": "counter",
+  "height": 3,
+  "output": "screen",
+  "type": "integer",
+  "width": 2
+}

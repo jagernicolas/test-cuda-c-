@@ -1,0 +1,42 @@
+@startuml
+|CPU|
+start
+note right
+  from local/AWS shell
+end note
+:CLI App Started;
+:Initialization;
+note right
+  create variable like
+  width, type, count....
+  with default values
+end note
+if (Has --config option?) then (true)
+  :update variables;
+else (false)
+endif
+if (Has --width option?) then (true)
+  :update width;
+else (false)
+endif
+-[dashed]-> same for every option;
+if (any invalid value?) then (true)
+  :Exit with error message;
+  note right
+e.g. we shouldn't
+have a timer
+and a counter
+  end note
+else (false)
+endif
+
+while (timer ended?) is (false)
+  :**playWithCuda()**;
+endwhile (true)
+
+while (counter ended?) is (false)
+  :**playWithCuda()**;
+endwhile (true)
+
+stop
+@enduml
