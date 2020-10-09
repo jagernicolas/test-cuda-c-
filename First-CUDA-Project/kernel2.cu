@@ -19,7 +19,9 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/ostreamwrapper.h>
 #include <algorithm> 
+#include <list>
 
+constexpr char KEY_CHANNEL[] = "channel";
 constexpr char KEY_CONFIG[] = "config";
 constexpr char KEY_DURATION[] = "duration";
 constexpr char KEY_DURATION_TYPE[] = "duration-type";
@@ -53,16 +55,10 @@ public:
     }
 };
 
-
-
-
-__global__ void addKernel(int *B, int *A, unsigned int size)
+__global__ void addKernel()
 {
-    //1;
-    for (int i = 0; i < size; i++)
-         B[i] = A[i];
+    // <kernel code here>
 }
-
 
 namespace application {
 enum class Type {
@@ -94,7 +90,6 @@ enum class DurationType {
     Timer
 };
 
-
 DurationType stringToDurationType(const std::string& key)
 {
     DurationType result = DurationType::Invalid;
@@ -112,36 +107,19 @@ DurationType stringToDurationType(const std::string& key)
     return result;
 }
 
-enum class Output {
-    Invalid,
-    File,
-    Screen
-};
-
-Output stringToOutput(const std::string& key)
-{
-    Output result = Output::Invalid;
-
-    std::map<std::string, Output> mapOfOutput = {
-        {"file", Output::File},
-        {"screen", Output::Screen}
-    };
-
-    std::map<std::string, Output>::iterator it = mapOfOutput.find(key);
-
-    if (it != mapOfOutput.end())
-        result = it->second;
-
-    return result;
-}
-
 struct Parameters {
+    int channel = -1;
     int duration = -1;
     DurationType durationType = DurationType::Invalid;
     int height = -1;
-    Output output = Output::Invalid;
+    std::string output {};
     Type type = Type::Invalid;
     int width = -1;
+};
+
+struct Timers {
+    float timer1 = -1.0f;
+    float timer2 = -1.0f;
 };
 }
 
@@ -168,6 +146,9 @@ int readJsonFile(const std::string configFile, application::Parameters &paramete
         return 1;
     }
 
+    if (doc.HasMember(KEY_CHANNEL) && doc[KEY_CHANNEL].IsInt())
+        parameters.channel = doc[KEY_CHANNEL].GetInt();
+
     if (doc.HasMember(KEY_DURATION) && doc[KEY_DURATION].IsInt())
         parameters.duration = doc[KEY_DURATION].GetInt();
 
@@ -189,7 +170,7 @@ int readJsonFile(const std::string configFile, application::Parameters &paramete
     if (doc.HasMember(KEY_OUTPUT) && doc[KEY_OUTPUT].IsString())
     {
         auto output = doc[KEY_OUTPUT].GetString();
-        parameters.output = application::stringToOutput(output);
+        parameters.output = doc[KEY_OUTPUT].GetString();
     }
 
     if (doc.HasMember(KEY_WIDTH) && doc[KEY_WIDTH].IsInt())
@@ -202,7 +183,13 @@ int validate(application::Parameters& parameters)
 {
     int err = 0;
 
-    if (parameters.duration < 1)
+
+    if (parameters.channel < 1)
+    {
+        std::cerr << "Invalid channel!" << std::endl;
+        err = 1;
+    }
+    else if (parameters.duration < 1)
     {
         std::cerr << "Invalid duration!" << std::endl;
         err = 1;
@@ -215,11 +202,6 @@ int validate(application::Parameters& parameters)
     else if (parameters.height < 1)
     {
         std::cerr << "Invalid height!" << std::endl;
-        err = 1;
-    }
-    else if (parameters.output == application::Output::Invalid)
-    {
-        std::cerr << "Invalid output type" << std::endl;
         err = 1;
     }
     else if (parameters.type == application::Type::Invalid)
@@ -247,6 +229,9 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
 
     if (err == 0)
     {
+        if (result.count(KEY_CHANNEL))
+            parameters.channel = result[KEY_CHANNEL].as<int>();
+
         if (result.count(KEY_DURATION))
             parameters.duration = result[KEY_DURATION].as<int>();
 
@@ -262,7 +247,7 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
         if (result.count(KEY_OUTPUT))
         {
             auto output = result[KEY_OUTPUT].as<std::string>();
-            parameters.output = application::stringToOutput(output);
+            parameters.output = output;
         }
 
         if (result.count(KEY_TYPE))
@@ -278,103 +263,139 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
     return err;
 }
 
-cudaError_t copyCuda(const application::Parameters& parameters, int*** arrayRGB);
+template <class T>
+cudaError_t copyCuda(const application::Parameters& parameters, T* arrayOnCpu, application::Timers &timers);
 
-void startCounterLoop(const application::Parameters& parameters, int*** arrayRGB)
+template <class T>
+void startCounterLoop(const application::Parameters& parameters, T* arrayOnCpu, std::list<application::Timers> &listOfTimers)
 {
-    const int height = parameters.height;
-    const int width = parameters.width;
     const int duration = parameters.duration;
-
-    int h = 0;
-    int w = 0;
-    int c = 0;
-
-    for (h = 0; h < height; h++) {
-        printf("Height %d\n", h);
-        for (w = 0; w < width; w++) {
-            for (c = 0; c < 3; c++) {
-                printf("%.2d ", arrayRGB[h][w][c]);
-            }
-            printf("\n");
-        }
-        printf("\n");
-    }
 
     for (int i = 0; i < duration; i++)
     {
-        //std::cout << "it: " << i << std::endl;
-        copyCuda(parameters, arrayRGB);
+        application::Timers timers;
+        copyCuda(parameters, arrayOnCpu, timers);
+        listOfTimers.push_back(timers);
     }
-
 }
 
-void startTimerLoop(application::Parameters& parameters, int*** arrayRGB)
+template <class T>
+void startTimerLoop(application::Parameters& parameters, T* arrayOnCpu, std::list<application::Timers> & listOfTimers)
 {
     const int duration = parameters.duration;
+
     auto start = std::chrono::system_clock::now();
     auto end = std::chrono::system_clock::now();
     while ((std::chrono::duration_cast<std::chrono::seconds>(end - start).count() != duration))
     {
-        copyCuda(parameters, arrayRGB);
+        application::Timers timers;
+        copyCuda(parameters, arrayOnCpu, timers);
+        listOfTimers.push_back(timers);
         end = std::chrono::system_clock::now();
     }
 }
 
+void printToScreen(std::list<application::Timers> &listOfTimers)
+{
+    for (auto const& i : listOfTimers)
+        std::cout << i.timer1 << ", " << i.timer2 << std::endl;
+}
 
+void printToFile(const std::string &output, std::list<application::Timers>& listOfTimers)
+{
+    std::ofstream outputFile(output);
 
-void startCopyTest(application::Parameters &parameters)
+    if (outputFile.is_open())
+        for (auto const& i : listOfTimers)
+            outputFile << i.timer1 << ", " << i.timer2 << std::endl;
+    else
+        std::cerr << "cannot open file!" << std::endl;
+}
+
+void print(application::Parameters& parameters, std::list<application::Timers>& listOfTimers)
+{
+    const auto output = parameters.output;
+
+    if (output.size())
+        printToFile(output, listOfTimers);
+    else
+        printToScreen(listOfTimers);
+}
+
+template <class T>
+int startCopyTest(application::Parameters &parameters, std::list<application::Timers> &listOfTimers)
 {
     const int height = parameters.height;
     const int width = parameters.width;
-    const int channels = 3; // add to options list
-   
-    int*** arrayRGB;
+    const int channels = parameters.channel; 
+    const int size = height * width * channels;
 
+    T *arrayOnCpu = (T*)malloc(sizeof(T) * size);
 
-    int h = 0;
-    int w = 0;
-    int c = 0;
-
-    arrayRGB = (int***)malloc(sizeof(int***) * height);
-    for (h = 0; h < height; h++) {
-        arrayRGB[h] = (int**)malloc(sizeof(int*) * width);
-        for (w = 0; w < width; w++) {
-            arrayRGB[h][w] = (int*)malloc(sizeof(int) * channels);
-            for (c = 0; c < 3; c++)
-                arrayRGB[h][w][c] = 6;
-        }
+    if (arrayOnCpu == NULL)
+    {
+        std::cerr << "arrayOnCpu allocation failed!" << std::endl;
+        return 1;
     }
 
     if (parameters.durationType == application::DurationType::Counter)
-        startCounterLoop(parameters, arrayRGB);
+        startCounterLoop<T>(parameters, arrayOnCpu, listOfTimers);
     else if (parameters.durationType == application::DurationType::Timer)
-        startTimerLoop(parameters, arrayRGB);
+        startTimerLoop<T>(parameters, arrayOnCpu, listOfTimers);
 
+    free(arrayOnCpu);
+    return 0;
+}
 
-    for (h = 0; h < height; h++)  {
-        for (w = 0; w < width; w++) {
-            free(arrayRGB[h][w]);
-        }
-        free(arrayRGB[h]);
+int startCopyTest2(application::Parameters& parameters, std::list<application::Timers>& listOfTimers)
+{
+    int err = 0;
+    auto type = parameters.type;
+
+    switch (type)
+    {
+        case application::Type::Floating:
+            err = startCopyTest<float>(parameters, listOfTimers);
+            break;
+        case application::Type::Integer:
+            err = startCopyTest<int>(parameters, listOfTimers);
+            break;
+        case application::Type::Invalid:
+            std::cerr << "Invalid type!" << std::endl;
+            err = 1;
+            break;
     }
-    free(arrayRGB);
 
+    return err;
+}
+
+
+void print(application::Parameters &parameters)
+{
+    std::cout << "channel: " << parameters.channel << std::endl;
+    std::cout << "duration: " << parameters.duration << std::endl;
+    std::cout << "duration-type: " << (parameters.durationType == application::DurationType::Timer ? "Timer" : "Counter") << std::endl;
+    std::cout << "height: " << parameters.height << std::endl;
+    std::cout << "output: " << parameters.output << std::endl;
+    std::cout << "type: " << (parameters.type == application::Type::Floating ? "Floating" : "Integer") << std::endl;
+    std::cout << "width: " << parameters.width << std::endl;
 }
 
 int main(int argc, char** argv)
 {
     application::Parameters parameters;
+    std::list<application::Timers> listOfTimers;
 
     cxxopts::ParseResult result;
-    cxxopts::Options options("first-CUDA-Project", "copy back and forth from host to GPU an array and ");
+    cxxopts::Options options("first-CUDA-Project", "copy back and forth from host to GPU an array and measure times.");
 
     options.add_options()
-        (KEY_CONFIG, "Config file to load.", cxxopts::value<std::string>()->default_value(""))
+        (KEY_CHANNEL, "Number of channels for the array.", cxxopts::value<int>())
+        (KEY_CONFIG, "Config file to load.", cxxopts::value<std::string>())
         (KEY_DURATION, "Number of iterations or time in seconds.", cxxopts::value<int>())
         (KEY_DURATION_TYPE, "Possible value is counter or timer.", cxxopts::value<std::string>())
         (KEY_HEIGHT, "Height of the array.", cxxopts::value<int>())
-        (KEY_OUTPUT, "Possible value is screen or file.", cxxopts::value<std::string>())
+        (KEY_OUTPUT, "Store to file instead of print to screen.", cxxopts::value<std::string>())
         (KEY_TYPE, "Possible value is floating or integer.", cxxopts::value<std::string>())
         (KEY_WIDTH, "Width of the array", cxxopts::value<int>())
         (KEY_HELP, "Print usage.");
@@ -394,34 +415,31 @@ int main(int argc, char** argv)
         std::cerr << "(EE) applyOptions -> error" << std::endl;
     else if (validate(parameters))
         std::cerr << "(EE) validate -> error" << std::endl;
+    else if (startCopyTest2(parameters, listOfTimers))
+        std::cerr << "(EE) startCopyTest -> error" << std::endl;
     else
-        startCopyTest(parameters);
-
-    std::cout << "duration: " << parameters.duration << std::endl;
-    std::cout << "duration-type: " << (parameters.durationType == application::DurationType::Timer ? "Timer" : "Counter") << std::endl;
-    std::cout << "height: " << parameters.height << std::endl;
-    std::cout << "output: " << (parameters.output == application::Output::File ? "File" : "Screen") << std::endl;
-    std::cout << "type: " << (parameters.type == application::Type::Floating ? "Floating" : "Integer") << std::endl;
-    std::cout << "width: " << parameters.width << std::endl;
+        print(parameters, listOfTimers);
+        //print(parameters);
     
+    // cudaDeviceReset must be called before exiting in order for profiling and
+    // tracing tools such as Nsight and Visual Profiler to show complete traces.
+    auto cudaStatus = cudaDeviceReset();
+    if (cudaStatus != cudaSuccess) {
+        std::cerr <<  "cudaDeviceReset failed!" << std::endl;
+        return 1;
+    }
+
    return 0;
 }
 
-int to1D(const int h, const int w, const int c, const application::Parameters& parameters) {
-    const int height = parameters.height;
-    const int width = parameters.width;
-
-    return (c * height * width) + (w * height) + h;
-}
-
-cudaError_t copyCuda(const application::Parameters& parameters, int*** arrayRGB)
+template <class T>
+cudaError_t copyCuda(const application::Parameters& parameters, T* arrayOnCpu, application::Timers& timers)
 {
     const int height = parameters.height;
     const int width = parameters.width;
-    const int channels = 3; // add to options list
+    const int channels = parameters.channel;
+    const int size = height * width * channels;
 
-
-    auto* timer1 = new cLimitTimer(1000);
     cudaError_t cudaStatus;
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -429,71 +447,54 @@ cudaError_t copyCuda(const application::Parameters& parameters, int*** arrayRGB)
     cudaEvent_t start2, stop2;
     cudaEventCreate(&start2);
     cudaEventCreate(&stop2);
-    float milliseconds = 0;
-    float milliseconds2 = 0;
-    int* hostToGpu1D = (int*)malloc(sizeof(int) * height * height * channels);
 
-    int* GpuToHost1D = (int*)malloc(sizeof(int) * height * height * channels);
-
-    int* onGpu = 0;
-
-    printf("initialization time: ");
-    delete timer1;
+    T* resultArrayFromGPU = (T*)malloc(sizeof(T) * size);
+    T* arrayOnGpu = 0;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0); // add this to options
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
         goto Error;
-
     }
 
     // Allocate GPU buffers for three vectors (two input, one output).
-    cudaStatus = cudaMalloc((void**)&onGpu, height * width * channels * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&arrayOnGpu, size * sizeof(T));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
     }
 
     // Copy input vectors from host memory to GPU buffers.
-    timer1 = new cLimitTimer(1000);
     cudaEventRecord(start);
-    cudaStatus = cudaMemcpy(onGpu, hostToGpu1D, height * width * channels * sizeof(int), cudaMemcpyHostToDevice);
+    cudaStatus = cudaMemcpy(arrayOnGpu, arrayOnCpu, size * sizeof(T), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy onGpu, hostToGpu1D!");
+        fprintf(stderr, "cudaMemcpy arrayOnGpu, hostToGpu1D!");
         goto Error;
     }
-
     cudaEventRecord(stop);
-    printf("Host->GPU... : ");
-    delete timer1;
 
     // <Launch a kernel on the GPU here>
 
     // Copy output vector from GPU buffer to host memory.
-    timer1 = new cLimitTimer(1000);
     cudaEventRecord(start2);
-    cudaStatus = cudaMemcpy(GpuToHost1D, onGpu, height * width * channels * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaStatus = cudaMemcpy(resultArrayFromGPU, arrayOnGpu, size * sizeof(T), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy GpuToHost1D, onGpu failed!");
+        fprintf(stderr, "cudaMemcpy resultArrayFromGPU, arrayOnGpu failed!");
         goto Error;
     }
-
     cudaEventRecord(stop2);
-    printf("GPU->Host... : ");
-    delete timer1;
 
     cudaEventSynchronize(stop);
     cudaEventSynchronize(stop2);
 
-    printf("\n\nCuda event timers:\n");
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Host->GPU, Ellapsed time: %fms\n", milliseconds);
-    cudaEventElapsedTime(&milliseconds2, start2, stop2);
-    printf("GPU->Host, Ellapsed time: %fms\n", milliseconds2);
+    // Get elapsed times.
+    cudaEventElapsedTime(&timers.timer1, start, stop); // in ms
+    cudaEventElapsedTime(&timers.timer2, start2, stop2); // in ms
 
 Error:
-    cudaFree(onGpu);
+    cudaFree(arrayOnGpu);
+    cudaFree(resultArrayFromGPU);
 
     return cudaStatus;
 }

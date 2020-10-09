@@ -1,8 +1,9 @@
 {
+  "channel": 3,
   "duration": 4,
   "duration-type": "counter",
   "height": 3,
-  "output": "screen",
-  "type": "integer",
+  "output": "",
+  "type": "floating",
   "width": 2
 }
