@@ -2,8 +2,8 @@
   "channel": 3,
   "duration": 4,
   "duration-type": "counter",
-  "height": 3,
+  "height": 1080,
   "output": "",
   "type": "floating",
-  "width": 2
+  "width": 1920
 }
