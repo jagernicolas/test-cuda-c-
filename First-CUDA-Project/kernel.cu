@@ -499,7 +499,7 @@ int startCopyTest(application::Parameters &parameters, std::list<application::Ti
     return err;
 }
 
-int startCopyTest2(application::Parameters& parameters, std::list<application::Timers>& listOfTimers)
+int process(application::Parameters& parameters, std::list<application::Timers>& listOfTimers)
 {
     int err = 0;
     auto type = parameters.type;
@@ -573,8 +573,8 @@ int main(int argc, char** argv)
         std::cerr << "(EE) applyOptions -> error" << std::endl;
     else if (err = validate(parameters), err)
         std::cerr << "(EE) validate -> error" << std::endl;
-    else if (err = startCopyTest2(parameters, listOfTimers), err)
-        std::cerr << "(EE) startCopyTest2 -> error" << std::endl;
+    else if (err = process(parameters, listOfTimers), err)
+        std::cerr << "(EE) process -> error" << std::endl;
     else
     {
         print(parameters, listOfTimers);
