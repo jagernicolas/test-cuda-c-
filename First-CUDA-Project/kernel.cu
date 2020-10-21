@@ -22,7 +22,10 @@
 #include <list>
 #include "nvToolsExt.h"
 #include <limits> // press enter...
+#include <Windows.h>
 
+
+constexpr char KEY_ASYNC[] = "async";
 constexpr char KEY_CHANNEL[] = "channel";
 constexpr char KEY_CONFIG[] = "config";
 constexpr char KEY_DURATION[] = "duration";
@@ -152,10 +155,11 @@ struct Parameters {
     int duration = -1;
     DurationType durationType = DurationType::Invalid;
     int height = -1;
-    std::string output {};
+    std::string output{};
     Transfer transfer = Transfer::Invalid;
     Type type = Type::Invalid;
     int width = -1;
+    bool isAsync{ false };
 };
 
 struct Timers {
@@ -186,6 +190,9 @@ int readJsonFile(const std::string configFile, application::Parameters &paramete
             << "Offset : " << doc.GetErrorOffset() << std::endl;
         return 1;
     }
+
+    if(doc.HasMember(KEY_ASYNC) && doc[KEY_ASYNC].IsBool())
+        parameters.isAsync = doc[KEY_ASYNC].GetBool();
 
     if (doc.HasMember(KEY_CHANNEL) && doc[KEY_CHANNEL].IsInt())
         parameters.channel = doc[KEY_CHANNEL].GetInt();
@@ -281,6 +288,9 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
 
     if (err == 0)
     {
+        if (result.count(KEY_ASYNC))
+            parameters.isAsync = result[KEY_ASYNC].as<bool>();
+
         if (result.count(KEY_CHANNEL))
             parameters.channel = result[KEY_CHANNEL].as<int>();
 
@@ -322,7 +332,7 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
 }
 
 template <class T>
-int copyCuda(const application::Parameters& parameters, T* host, T* D2H, application::Timers &timers);
+int copy(const application::Parameters& parameters, T* host, T* D2H, application::Timers &timers);
 
 template <class T>
 int startCounterLoop(const application::Parameters& parameters, T* host, T* D2H, std::list<application::Timers> &listOfTimers)
@@ -333,7 +343,7 @@ int startCounterLoop(const application::Parameters& parameters, T* host, T* D2H,
     for (int i = 0; i < duration; i++)
     {
         application::Timers timers;
-        if (err = copyCuda(parameters, host, D2H, timers), err)
+        if (err = copy(parameters, host, D2H, timers), err)
             break;
         listOfTimers.push_back(timers);
     }
@@ -352,7 +362,7 @@ int startTimerLoop(application::Parameters& parameters, T* host, T* D2H, std::li
     while ((std::chrono::duration_cast<std::chrono::seconds>(end - start).count() != duration))
     {
         application::Timers timers;
-        if (err = copyCuda(parameters, host, D2H, timers), err)
+        if (err = copy(parameters, host, D2H, timers), err)
             break;
         listOfTimers.push_back(timers);
         end = std::chrono::system_clock::now();
@@ -514,15 +524,17 @@ int startCopyTest2(application::Parameters& parameters, std::list<application::T
 
 void print(application::Parameters &parameters)
 {
+    // enum to string are limited.
+    std::cout << "isAsync: " << (parameters.isAsync ? "true" : "false") << std::endl;
     std::cout << "channel: " << parameters.channel << std::endl;
     std::cout << "duration: " << parameters.duration << std::endl;
     std::cout << "duration-type: " << (parameters.durationType == application::DurationType::Timer ? "Timer" : "Counter") << std::endl;
     std::cout << "height: " << parameters.height << std::endl;
     std::cout << "output: " << parameters.output << std::endl;
+    std::cout << "transfer: " << (parameters.transfer  == application::Transfer::Pageable ? "Pageable" : "Pinned")<< std::endl;
     std::cout << "type: " << (parameters.type == application::Type::Floating ? "Floating" : "Integer") << std::endl;
     std::cout << "width: " << parameters.width << std::endl;
 }
-#include <Windows.h>
 
 int main(int argc, char** argv)
 {
@@ -534,6 +546,7 @@ int main(int argc, char** argv)
     cxxopts::Options options("first-CUDA-Project", "copy back and forth from host to GPU an array and measure times.");
 
     options.add_options()
+        (KEY_ASYNC, "Copy using streams (2).", cxxopts::value<bool>()->default_value("false"))
         (KEY_CHANNEL, "Number of channels for the array.", cxxopts::value<int>())
         (KEY_CONFIG, "Config file to load.", cxxopts::value<std::string>())
         (KEY_DURATION, "Number of iterations or time in seconds.", cxxopts::value<int>())
@@ -561,10 +574,12 @@ int main(int argc, char** argv)
     else if (err = validate(parameters), err)
         std::cerr << "(EE) validate -> error" << std::endl;
     else if (err = startCopyTest2(parameters, listOfTimers), err)
-        std::cerr << "(EE) startCopyTest -> error" << std::endl;
+        std::cerr << "(EE) startCopyTest2 -> error" << std::endl;
     else
+    {
         print(parameters, listOfTimers);
         //print(parameters);
+    }
     
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
@@ -586,7 +601,31 @@ int main(int argc, char** argv)
 }
 
 template <class T>
-int copyCuda(const application::Parameters& parameters, T* host, T* D2H, application::Timers& timers)
+int copyCUDA(const application::Parameters& parameters, T* dst, T* src, enum cudaMemcpyKind cpyKind)
+{
+    const int height = parameters.height;
+    const int width = parameters.width;
+    const int channels = parameters.channel;
+    const int size = height * width * channels;
+
+    int err = 0;
+
+    if (parameters.isAsync)
+    {
+        cudaStream_t stream;
+        cudaStreamCreate(&stream);
+        err = checkCuda(cudaMemcpyAsync(dst, src, size * sizeof(T), cpyKind, stream));
+    }
+    else
+    {
+        err = checkCuda(cudaMemcpy(dst, src, size * sizeof(T), cpyKind));
+    }
+
+    return err;
+}
+
+template <class T>
+int copy(const application::Parameters& parameters, T* host, T* D2H, application::Timers& timers)
 {
 
     const int height = parameters.height;
@@ -626,13 +665,12 @@ int copyCuda(const application::Parameters& parameters, T* host, T* D2H, applica
         nvtxRangePushEx(&eventAttrib);
         cudaEventRecord(startH2D);
 
-        if (checkCuda(cudaMemcpy(dev, host, size * sizeof(T), cudaMemcpyHostToDevice)))
-            err = 1;
-        else
-        {
-            cudaEventRecord(stopH2D);
-            nvtxRangePop();
-        }
+        //err = checkCuda(cudaMemcpy(dev, host, size * sizeof(T), cudaMemcpyHostToDevice))
+        err = copyCUDA<T>(parameters, dev, host, cudaMemcpyHostToDevice);
+
+        cudaEventRecord(stopH2D);
+        nvtxRangePop();
+
     }
 
     // <Launch a kernel on the GPU here>
@@ -650,13 +688,12 @@ int copyCuda(const application::Parameters& parameters, T* host, T* D2H, applica
 
         nvtxRangePushEx(&eventAttrib);
         cudaEventRecord(startD2H);
-        if (checkCuda(cudaMemcpy(D2H, dev, size * sizeof(T), cudaMemcpyDeviceToHost)))
-            err = 1;
-        else
-        {
-            cudaEventRecord(stopD2H);
-            nvtxRangePop();
-        }
+        //err = checkCuda(cudaMemcpy(D2H, dev, size * sizeof(T), cudaMemcpyDeviceToHost))
+        err = copyCUDA(parameters, D2H, dev, cudaMemcpyDeviceToHost);
+
+        cudaEventRecord(stopD2H);
+        nvtxRangePop();
+
     }
 
     // Synchronize CUDA events and get timers
