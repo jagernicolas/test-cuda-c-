@@ -30,8 +30,22 @@ constexpr char KEY_DURATION_TYPE[] = "duration-type";
 constexpr char KEY_HEIGHT[] = "height";
 constexpr char KEY_HELP[] = "help";
 constexpr char KEY_OUTPUT[] = "output";
+constexpr char KEY_TRANSFER[] = "transfer";
 constexpr char KEY_TYPE[] = "type";
 constexpr char KEY_WIDTH[] = "width";
+
+// Convenience function for checking CUDA runtime API results
+// can be wrapped around any runtime API call. No-op in release builds.
+inline
+int checkCuda(cudaError_t result)
+{
+    if (result != cudaSuccess) {
+        fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+        return 1;
+    }
+
+    return 0;
+}
 
 class cLimitTimer
 {
@@ -86,6 +100,30 @@ Type stringToType(const std::string& key)
     return result;
 }
 
+
+enum class Transfer {
+    Invalid,
+    Pageable,
+    Pinned
+};
+
+Transfer stringToTransfer(const std::string& key)
+{
+    Transfer result = Transfer::Invalid;
+
+    std::map<std::string, Transfer> mapOfType = {
+        {"pageable", Transfer::Pageable},
+        {"pinned", Transfer::Pinned}
+    };
+
+    std::map<std::string, Transfer>::iterator it = mapOfType.find(key);
+
+    if (it != mapOfType.end())
+        result = it->second;
+
+    return result;
+}
+
 enum class DurationType {
     Invalid,
     Counter,
@@ -115,13 +153,14 @@ struct Parameters {
     DurationType durationType = DurationType::Invalid;
     int height = -1;
     std::string output {};
+    Transfer transfer = Transfer::Invalid;
     Type type = Type::Invalid;
     int width = -1;
 };
 
 struct Timers {
-    float timer1 = -1.0f;
-    float timer2 = -1.0f;
+    float timerH2D = -1.0f;
+    float timerD2H = -1.0f;
 };
 }
 
@@ -163,6 +202,12 @@ int readJsonFile(const std::string configFile, application::Parameters &paramete
     if (doc.HasMember(KEY_HEIGHT) && doc[KEY_HEIGHT].IsInt())
         parameters.height = doc[KEY_HEIGHT].GetInt();
 
+    if (doc.HasMember(KEY_TRANSFER) && doc[KEY_TRANSFER].IsString())
+    {
+        auto type = doc[KEY_TRANSFER].GetString();
+        parameters.transfer = application::stringToTransfer(type);
+    }
+
     if (doc.HasMember(KEY_TYPE) && doc[KEY_TYPE].IsString())
     {
         auto type = doc[KEY_TYPE].GetString();
@@ -188,32 +233,37 @@ int validate(application::Parameters& parameters)
 
     if (parameters.channel < 1)
     {
-        std::cerr << "Invalid channel!" << std::endl;
+        std::cerr << "Invalid channel option" << std::endl;
         err = 1;
     }
     else if (parameters.duration < 1)
     {
-        std::cerr << "Invalid duration!" << std::endl;
+        std::cerr << "Invalid duration option" << std::endl;
         err = 1;
     } 
     else if (parameters.durationType == application::DurationType::Invalid)
     {
-        std::cerr << "Invalid duration type" << std::endl;
+        std::cerr << "Invalid duration type option" << std::endl;
         err = 1;
     }
     else if (parameters.height < 1)
     {
-        std::cerr << "Invalid height!" << std::endl;
+        std::cerr << "Invalid height option" << std::endl;
         err = 1;
     }
     else if (parameters.type == application::Type::Invalid)
     {
-        std::cerr << "Invalid type" << std::endl;
+        std::cerr << "Invalid type option" << std::endl;
+        err = 1;
+    }
+    else if (parameters.transfer == application::Transfer::Invalid)
+    {
+        std::cerr << "Invalid transfer option" << std::endl;
         err = 1;
     }
     else if (parameters.width< 1)
     {
-        std::cerr << "Invalid width!" << std::endl;
+        std::cerr << "Invalid width option" << std::endl;
         err = 1;
     }
 
@@ -252,6 +302,12 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
             parameters.output = output;
         }
 
+        if (result.count(KEY_TRANSFER))
+        {
+            auto transfer = result[KEY_TRANSFER].as<std::string>();
+            parameters.transfer = application::stringToTransfer(transfer);
+        }
+
         if (result.count(KEY_TYPE))
         {
             auto type = result[KEY_TYPE].as<std::string>();
@@ -266,43 +322,49 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
 }
 
 template <class T>
-int copyCuda(const application::Parameters& parameters, T* arrayOnCpu, application::Timers &timers);
+int copyCuda(const application::Parameters& parameters, T* host, T* D2H, application::Timers &timers);
 
 template <class T>
-void startCounterLoop(const application::Parameters& parameters, T* arrayOnCpu, std::list<application::Timers> &listOfTimers)
+int startCounterLoop(const application::Parameters& parameters, T* host, T* D2H, std::list<application::Timers> &listOfTimers)
 {
     const int duration = parameters.duration;
+    int err = 0;
 
     for (int i = 0; i < duration; i++)
     {
         application::Timers timers;
-        if (copyCuda(parameters, arrayOnCpu, timers))
+        if (err = copyCuda(parameters, host, D2H, timers), err)
             break;
         listOfTimers.push_back(timers);
     }
+
+    return err;
 }
 
 template <class T>
-void startTimerLoop(application::Parameters& parameters, T* arrayOnCpu, std::list<application::Timers> & listOfTimers)
+int startTimerLoop(application::Parameters& parameters, T* host, T* D2H, std::list<application::Timers> & listOfTimers)
 {
     const int duration = parameters.duration;
+    int err = 0;
 
     auto start = std::chrono::system_clock::now();
     auto end = std::chrono::system_clock::now();
     while ((std::chrono::duration_cast<std::chrono::seconds>(end - start).count() != duration))
     {
         application::Timers timers;
-        if (copyCuda(parameters, arrayOnCpu, timers))
+        if (err = copyCuda(parameters, host, D2H, timers), err)
             break;
         listOfTimers.push_back(timers);
         end = std::chrono::system_clock::now();
     }
+
+    return err;
 }
 
 void printToScreen(std::list<application::Timers> &listOfTimers)
 {
     for (auto const& i : listOfTimers)
-        std::cout << i.timer1 << ", " << i.timer2 << std::endl;
+        std::cout << i.timerH2D << ", " << i.timerD2H << std::endl;
 }
 
 void printToFile(const std::string &output, std::list<application::Timers>& listOfTimers)
@@ -311,7 +373,7 @@ void printToFile(const std::string &output, std::list<application::Timers>& list
 
     if (outputFile.is_open())
         for (auto const& i : listOfTimers)
-            outputFile << i.timer1 << ", " << i.timer2 << std::endl;
+            outputFile << i.timerH2D << ", " << i.timerD2H << std::endl;
     else
         std::cerr << "cannot open file!" << std::endl;
 }
@@ -327,28 +389,104 @@ void print(application::Parameters& parameters, std::list<application::Timers>& 
 }
 
 template <class T>
+void fillArrays(application::Parameters& parameters, T* host, T* D2H)
+{
+    const int height = parameters.height;
+    const int width = parameters.width;
+    const int channels = parameters.channel;
+    const int size = height * width * channels;
+
+    for (int i = 0; i < size; ++i)
+    {
+        host[i] = static_cast<T>(1.0);
+        D2H[i] = static_cast <T>(0.0);
+    }
+}
+
+template <class T>
 int startCopyTest(application::Parameters &parameters, std::list<application::Timers> &listOfTimers)
 {
     const int height = parameters.height;
     const int width = parameters.width;
     const int channels = parameters.channel; 
     const int size = height * width * channels;
+    int err = 0;
 
-    T *arrayOnCpu = (T*)malloc(sizeof(T) * size);
-
-    if (arrayOnCpu == NULL)
+    T* host = nullptr;
+    T* D2H = nullptr;
+    
+    // arrays allocation
+    switch (parameters.transfer)
     {
-        std::cerr << "arrayOnCpu allocation failed!" << std::endl;
-        return 1;
+        case application::Transfer::Pageable:
+        {
+            host = (T*)malloc(sizeof(T) * size);
+            D2H = (T*)malloc(sizeof(T) * size);
+            break;
+        }
+        case application::Transfer::Pinned:
+        {
+            if (err = checkCuda(cudaMallocHost((T**)&host, size * sizeof(T))), err)
+            {
+                break;
+            }
+            else if (err = checkCuda(cudaMallocHost((T**)&D2H, size * sizeof(T))), err)
+            {
+                break;
+            }
+            break;
+        }
+        case::application::Transfer::Invalid:
+            err = 1;
+    }
+            
+
+    if (host == nullptr)
+    {
+        std::cerr << "host allocation failed!" << std::endl;
+        err = 1;
+    }
+    else if (D2H == nullptr)
+    {
+        std::cerr << "D2H allocation failed!" << std::endl;
+        err = 1;
     }
 
-    if (parameters.durationType == application::DurationType::Counter)
-        startCounterLoop<T>(parameters, arrayOnCpu, listOfTimers);
-    else if (parameters.durationType == application::DurationType::Timer)
-        startTimerLoop<T>(parameters, arrayOnCpu, listOfTimers);
+    if (!err)
+    {
+        fillArrays(parameters, host, D2H);
 
-    free(arrayOnCpu);
-    return 0;
+        if (parameters.durationType == application::DurationType::Counter && !err)
+            err = startCounterLoop<T>(parameters, host, D2H, listOfTimers);
+        else if (parameters.durationType == application::DurationType::Timer && !err)
+            err = startTimerLoop<T>(parameters, host, D2H, listOfTimers);
+
+        // free allocations
+        switch (parameters.transfer)
+        {
+        case application::Transfer::Pageable:
+        {
+            if (host)
+                free(host);
+            if (D2H)
+                free(D2H);
+            break;
+        }
+        case application::Transfer::Pinned:
+        {
+            if (host)
+                cudaFreeHost(host);
+            if (D2H)
+                cudaFreeHost(D2H);
+            break;
+        }
+        case::application::Transfer::Invalid:
+            err = 1;
+        }
+    }
+    
+    
+    return err;
 }
 
 int startCopyTest2(application::Parameters& parameters, std::list<application::Timers>& listOfTimers)
@@ -388,37 +526,6 @@ void print(application::Parameters &parameters)
 
 int main(int argc, char** argv)
 {
-    /*
-    nvtxNameOsThread(1, "MAIN");
-    nvtxRangePush(__FUNCTION__);
-    std::cout << "1F" << std::endl;
-    Sleep(100);
-    nvtxRangePop();
-
-    // zero the structure
-    nvtxEventAttributes_t eventAttrib = { 0 };
-
-    // set the version and the size information
-    eventAttrib.version = NVTX_VERSION;
-    eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-
-    static const uint32_t COLOR_GREEN = 0xFF00FF00;
-
-    // configure the attributes.  0 is the default for all attributes.
-    eventAttrib.colorType = NVTX_COLOR_ARGB;
-    eventAttrib.color = COLOR_GREEN;
-    eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
-    eventAttrib.message.ascii = __FUNCTION__ ":nvtxRangePushEx TOTO3";
-
-    nvtxRangePushEx(&eventAttrib);
-    std::cout << "3F" << std::endl;
-    Sleep(100);
-
-        nvtxRangePop();
-
-    return 0;
-    */
-
     application::Parameters parameters;
     std::list<application::Timers> listOfTimers;
     int err = 0;
@@ -433,6 +540,7 @@ int main(int argc, char** argv)
         (KEY_DURATION_TYPE, "Possible value is counter or timer.", cxxopts::value<std::string>())
         (KEY_HEIGHT, "Height of the array.", cxxopts::value<int>())
         (KEY_OUTPUT, "Store to file instead of print to screen.", cxxopts::value<std::string>())
+        (KEY_TRANSFER, "Transfer memory mode. possible options are \"pageable\" and \"pinned\".", cxxopts::value<std::string>()->default_value("pageable"))
         (KEY_TYPE, "Possible value is floating or integer.", cxxopts::value<std::string>())
         (KEY_WIDTH, "Width of the array", cxxopts::value<int>())
         (KEY_HELP, "Print usage.");
@@ -460,11 +568,15 @@ int main(int argc, char** argv)
     
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
+
+    err = checkCuda(cudaDeviceReset());
+    /*
     auto cudaStatus = cudaDeviceReset();
     if (cudaStatus != cudaSuccess) {
         std::cerr <<  "cudaDeviceReset failed!" << std::endl;
         err = 1;
     }
+    */
 
    // std::cout << "Press Enter to ContinueX";
 //#undef max // for visual studio intellisense...
@@ -474,108 +586,88 @@ int main(int argc, char** argv)
 }
 
 template <class T>
-int copyCuda(const application::Parameters& parameters, T* arrayOnCpu, application::Timers& timers)
+int copyCuda(const application::Parameters& parameters, T* host, T* D2H, application::Timers& timers)
 {
+
     const int height = parameters.height;
     const int width = parameters.width;
     const int channels = parameters.channel;
     const int size = height * width * channels;
+    const uint32_t COLOR_GREEN = 0xFF00FF00;
 
-    cudaError_t cudaStatus;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEvent_t start2, stop2;
-    cudaEventCreate(&start2);
-    cudaEventCreate(&stop2);
+    //cudaError_t cudaStatus;
+    cudaEvent_t startH2D, stopH2D;
+    cudaEventCreate(&startH2D);
+    cudaEventCreate(&stopH2D);
+    cudaEvent_t startD2H, stopD2H;
+    cudaEventCreate(&startD2H);
+    cudaEventCreate(&stopD2H);
 
-    T* resultArrayFromGPU = (T*)malloc(sizeof(T) * size);
-    T* arrayOnGpu = 0;
+    T* dev = 0;
+    int err = 0;
+    nvtxEventAttributes_t eventAttrib = { 0 }; // zero the structure
 
     // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0); // add this to options
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
+    if (checkCuda(cudaSetDevice(0)))
+        err = 1;
+    else if (checkCuda(cudaMalloc((void**)&dev, size * sizeof(T))))
+        err = 1;
+    else
+    {
+        // Copy input vectors from host memory to GPU buffers.
+        eventAttrib = { 0 }; // zero the structure
+        eventAttrib.version = NVTX_VERSION;
+        eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+        eventAttrib.colorType = NVTX_COLOR_ARGB;
+        eventAttrib.color = COLOR_GREEN;
+        eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+        eventAttrib.message.ascii = __FUNCTION__ ":timerH2D ";
+
+        nvtxRangePushEx(&eventAttrib);
+        cudaEventRecord(startH2D);
+
+        if (checkCuda(cudaMemcpy(dev, host, size * sizeof(T), cudaMemcpyHostToDevice)))
+            err = 1;
+        else
+        {
+            cudaEventRecord(stopH2D);
+            nvtxRangePop();
+        }
     }
-
-    // Allocate GPU buffers for three vectors (two input, one output).
-    cudaStatus = cudaMalloc((void**)&arrayOnGpu, size * sizeof(T));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    //nvtxNameOsThread(0, "Main Thread");
-    //nvtxRangePush(__FUNCTION__);
-    //nvtxRangePush("cudaEventRecord start");
-    // zero the structure
-    nvtxEventAttributes_t eventAttrib = { 0 };
-
-    // set the version and the size information
-    eventAttrib.version = NVTX_VERSION;
-    eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-
-    static const uint32_t COLOR_GREEN = 0xFF00FF00;
-
-    // configure the attributes.  0 is the default for all attributes.
-    eventAttrib.colorType = NVTX_COLOR_ARGB;
-    eventAttrib.color = COLOR_GREEN;
-    eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
-    eventAttrib.message.ascii = __FUNCTION__ ":timer1 ";
-
-    nvtxRangePushEx(&eventAttrib);
-    
-    //Sleep(100);
-
-    //nvtxRangePop();
-    cudaEventRecord(start);
-    cudaStatus = cudaMemcpy(arrayOnGpu, arrayOnCpu, size * sizeof(T), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy arrayOnGpu, hostToGpu1D!");
-        goto Error;
-    }
-    cudaEventRecord(stop);
-    nvtxRangePop();
 
     // <Launch a kernel on the GPU here>
 
     // Copy output vector from GPU buffer to host memory.
-    //nvtxRangePushA("cudaEventRecord start2");
-    // zero the structure
-    nvtxEventAttributes_t eventAttrib2 = { 0 };
+    if (!err)
+    {
+        eventAttrib = { 0 }; // zero the structure
+        eventAttrib.version = NVTX_VERSION;
+        eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+        eventAttrib.colorType = NVTX_COLOR_ARGB;
+        eventAttrib.color = COLOR_GREEN;
+        eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+        eventAttrib.message.ascii = __FUNCTION__ ":timerD2H ";
 
-    // set the version and the size information
-    eventAttrib2.version = NVTX_VERSION;
-    eventAttrib2.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-
-    // configure the attributes.  0 is the default for all attributes.
-    eventAttrib2.colorType = NVTX_COLOR_ARGB;
-    eventAttrib2.color = COLOR_GREEN;
-    eventAttrib2.messageType = NVTX_MESSAGE_TYPE_ASCII;
-    eventAttrib2.message.ascii = __FUNCTION__ ":timer2 ";
-
-    nvtxRangePushEx(&eventAttrib2);
-    cudaEventRecord(start2);
-    cudaStatus = cudaMemcpy(resultArrayFromGPU, arrayOnGpu, size * sizeof(T), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy resultArrayFromGPU, arrayOnGpu failed!");
-        goto Error;
+        nvtxRangePushEx(&eventAttrib);
+        cudaEventRecord(startD2H);
+        if (checkCuda(cudaMemcpy(D2H, dev, size * sizeof(T), cudaMemcpyDeviceToHost)))
+            err = 1;
+        else
+        {
+            cudaEventRecord(stopD2H);
+            nvtxRangePop();
+        }
     }
-    cudaEventRecord(stop2);
-    nvtxRangePop();
 
-    cudaEventSynchronize(stop);
-    cudaEventSynchronize(stop2);
+    // Synchronize CUDA events and get timers
+    if (!err)
+    {
+        cudaEventSynchronize(stopH2D);
+        cudaEventSynchronize(stopD2H);
 
-    // Get elapsed times.
-    cudaEventElapsedTime(&timers.timer1, start, stop); // in ms
-    cudaEventElapsedTime(&timers.timer2, start2, stop2); // in ms
+        cudaEventElapsedTime(&timers.timerH2D, startH2D, stopH2D); // in ms
+        cudaEventElapsedTime(&timers.timerD2H, startD2H, stopD2H); // in ms
+    }
 
-Error:
-    cudaFree(arrayOnGpu);
-    cudaFree(resultArrayFromGPU);
-
-    return cudaStatus ? 1 : 0;
+    return err;
 }
