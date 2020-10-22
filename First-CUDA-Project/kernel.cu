@@ -32,6 +32,7 @@ constexpr char KEY_DURATION[] = "duration";
 constexpr char KEY_DURATION_TYPE[] = "duration-type";
 constexpr char KEY_HEIGHT[] = "height";
 constexpr char KEY_HELP[] = "help";
+constexpr char KEY_STREAMS[] = "streams";
 constexpr char KEY_OUTPUT[] = "output";
 constexpr char KEY_TRANSFER[] = "transfer";
 constexpr char KEY_TYPE[] = "type";
@@ -156,6 +157,7 @@ struct Parameters {
     DurationType durationType = DurationType::Invalid;
     int height = -1;
     std::string output{};
+    int streams = -1;
     Transfer transfer = Transfer::Invalid;
     Type type = Type::Invalid;
     int width = -1;
@@ -209,6 +211,9 @@ int readJsonFile(const std::string configFile, application::Parameters &paramete
     if (doc.HasMember(KEY_HEIGHT) && doc[KEY_HEIGHT].IsInt())
         parameters.height = doc[KEY_HEIGHT].GetInt();
 
+    if (doc.HasMember(KEY_STREAMS) && doc[KEY_STREAMS].IsInt())
+        parameters.streams = doc[KEY_STREAMS].GetInt();
+
     if (doc.HasMember(KEY_TRANSFER) && doc[KEY_TRANSFER].IsString())
     {
         auto type = doc[KEY_TRANSFER].GetString();
@@ -237,7 +242,6 @@ int validate(application::Parameters& parameters)
 {
     int err = 0;
 
-
     if (parameters.channel < 1)
     {
         std::cerr << "Invalid channel option" << std::endl;
@@ -256,6 +260,11 @@ int validate(application::Parameters& parameters)
     else if (parameters.height < 1)
     {
         std::cerr << "Invalid height option" << std::endl;
+        err = 1;
+    }
+    else if (parameters.streams < 1)
+    {
+        std::cerr << "Invalid streams option" << std::endl;
         err = 1;
     }
     else if (parameters.type == application::Type::Invalid)
@@ -312,6 +321,12 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
             parameters.output = output;
         }
 
+        if (result.count(KEY_STREAMS))
+        {
+            auto streams = result[KEY_STREAMS].as<int>();
+            parameters.streams = streams;
+        }
+
         if (result.count(KEY_TRANSFER))
         {
             auto transfer = result[KEY_TRANSFER].as<std::string>();
@@ -332,20 +347,36 @@ int applyOptions(cxxopts::ParseResult &result, application::Parameters& paramete
 }
 
 template <class T>
-int copy(const application::Parameters& parameters, T* host, T* D2H, application::Timers &timers);
+int copy(const application::Parameters& parameters, T* host, T* D2H, application::Timers &timers, cudaStream_t& stream);
 
 template <class T>
 int startCounterLoop(const application::Parameters& parameters, T* host, T* D2H, std::list<application::Timers> &listOfTimers)
 {
     const int duration = parameters.duration;
+    const int streams = parameters.streams;
     int err = 0;
 
+    std::list<cudaStream_t> streamList{};
+
+    for (int i = 0; i < streams; i++)
+    {
+        streamList.push_back({});
+        cudaStream_t stream = *streamList.end();
+        cudaStreamCreate(&stream);
+    }
+
+    auto it = streamList.begin();
     for (int i = 0; i < duration; i++)
     {
         application::Timers timers;
-        if (err = copy(parameters, host, D2H, timers), err)
+
+        if (err = copy(parameters, host, D2H, timers, *it), err)
             break;
+
         listOfTimers.push_back(timers);
+
+        if (++it == streamList.end())
+            it = streamList.begin();
     }
 
     return err;
@@ -355,16 +386,33 @@ template <class T>
 int startTimerLoop(application::Parameters& parameters, T* host, T* D2H, std::list<application::Timers> & listOfTimers)
 {
     const int duration = parameters.duration;
+    const int streams = parameters.streams;
     int err = 0;
+
+    std::list<cudaStream_t> streamList{};
+
+    for (int i = 0; i < streams; i++)
+    {
+        streamList.push_back({});
+        cudaStream_t stream = *streamList.end();
+        cudaStreamCreate(&stream);
+    };
 
     auto start = std::chrono::system_clock::now();
     auto end = std::chrono::system_clock::now();
+    auto it = streamList.begin();
     while ((std::chrono::duration_cast<std::chrono::seconds>(end - start).count() != duration))
     {
         application::Timers timers;
-        if (err = copy(parameters, host, D2H, timers), err)
+
+        if (err = copy(parameters, host, D2H, timers, *it), err)
             break;
+
         listOfTimers.push_back(timers);
+
+        if (++it == streamList.end())
+            it = streamList.begin();
+
         end = std::chrono::system_clock::now();
     }
 
@@ -531,6 +579,7 @@ void print(application::Parameters &parameters)
     std::cout << "duration-type: " << (parameters.durationType == application::DurationType::Timer ? "Timer" : "Counter") << std::endl;
     std::cout << "height: " << parameters.height << std::endl;
     std::cout << "output: " << parameters.output << std::endl;
+    std::cout << "streams: " << parameters.streams << std::endl;
     std::cout << "transfer: " << (parameters.transfer  == application::Transfer::Pageable ? "Pageable" : "Pinned")<< std::endl;
     std::cout << "type: " << (parameters.type == application::Type::Floating ? "Floating" : "Integer") << std::endl;
     std::cout << "width: " << parameters.width << std::endl;
@@ -553,6 +602,7 @@ int main(int argc, char** argv)
         (KEY_DURATION_TYPE, "Possible value is counter or timer.", cxxopts::value<std::string>())
         (KEY_HEIGHT, "Height of the array.", cxxopts::value<int>())
         (KEY_OUTPUT, "Store to file instead of print to screen.", cxxopts::value<std::string>())
+        (KEY_STREAMS, "Number of streams.", cxxopts::value<int>()->default_value("1"))
         (KEY_TRANSFER, "Transfer memory mode. possible options are \"pageable\" and \"pinned\".", cxxopts::value<std::string>()->default_value("pageable"))
         (KEY_TYPE, "Possible value is floating or integer.", cxxopts::value<std::string>())
         (KEY_WIDTH, "Width of the array", cxxopts::value<int>())
@@ -601,7 +651,7 @@ int main(int argc, char** argv)
 }
 
 template <class T>
-int copyCUDA(const application::Parameters& parameters, T* dst, T* src, enum cudaMemcpyKind cpyKind)
+int copyCUDA(const application::Parameters& parameters, T* dst, T* src, enum cudaMemcpyKind cpyKind, cudaStream_t& stream)
 {
     const int height = parameters.height;
     const int width = parameters.width;
@@ -612,8 +662,7 @@ int copyCUDA(const application::Parameters& parameters, T* dst, T* src, enum cud
 
     if (parameters.isAsync)
     {
-        cudaStream_t stream;
-        cudaStreamCreate(&stream);
+
         err = checkCuda(cudaMemcpyAsync(dst, src, size * sizeof(T), cpyKind, stream));
     }
     else
@@ -625,7 +674,7 @@ int copyCUDA(const application::Parameters& parameters, T* dst, T* src, enum cud
 }
 
 template <class T>
-int copy(const application::Parameters& parameters, T* host, T* D2H, application::Timers& timers)
+int copy(const application::Parameters& parameters, T* host, T* D2H, application::Timers& timers, cudaStream_t& stream)
 {
 
     const int height = parameters.height;
@@ -666,7 +715,7 @@ int copy(const application::Parameters& parameters, T* host, T* D2H, application
         cudaEventRecord(startH2D);
 
         //err = checkCuda(cudaMemcpy(dev, host, size * sizeof(T), cudaMemcpyHostToDevice))
-        err = copyCUDA<T>(parameters, dev, host, cudaMemcpyHostToDevice);
+        err = copyCUDA<T>(parameters, dev, host, cudaMemcpyHostToDevice, stream);
 
         cudaEventRecord(stopH2D);
         nvtxRangePop();
@@ -689,7 +738,7 @@ int copy(const application::Parameters& parameters, T* host, T* D2H, application
         nvtxRangePushEx(&eventAttrib);
         cudaEventRecord(startD2H);
         //err = checkCuda(cudaMemcpy(D2H, dev, size * sizeof(T), cudaMemcpyDeviceToHost))
-        err = copyCUDA(parameters, D2H, dev, cudaMemcpyDeviceToHost);
+        err = copyCUDA(parameters, D2H, dev, cudaMemcpyDeviceToHost, stream);
 
         cudaEventRecord(stopD2H);
         nvtxRangePop();
