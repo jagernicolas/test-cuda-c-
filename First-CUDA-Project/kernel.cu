@@ -75,9 +75,11 @@ public:
     }
 };
 
-__global__ void addKernel()
+template<class T>
+__global__ void addKernel(T *dev, int size)
 {
-    // <kernel code here>
+    for (int i = 0; i < size; i++)
+        dev[i] += 1;
 }
 
 namespace application {
@@ -356,27 +358,42 @@ int startCounterLoop(const application::Parameters& parameters, T* host, T* D2H,
     const int streams = parameters.streams;
     int err = 0;
 
-    std::list<cudaStream_t> streamList{};
+    std::list<cudaStream_t*> streamList{};
+
 
     for (int i = 0; i < streams; i++)
     {
-        streamList.push_back({});
-        cudaStream_t stream = *streamList.end();
-        cudaStreamCreate(&stream);
+        auto stream = new cudaStream_t();
+        cudaStreamCreate(stream);
+        std::cout << stream << std::endl;
+        streamList.push_back(stream);
     }
+    
+    std::cout << "size of streamList: " << streamList.size() << std::endl;
+    for (auto* stream : streamList)
+    {
+        std::cout << stream << std::endl;
+    }
+
 
     auto it = streamList.begin();
     for (int i = 0; i < duration; i++)
     {
+        std::cout << i << ": " << (*it) << std::endl;
         application::Timers timers;
 
-        if (err = copy(parameters, host, D2H, timers, *it), err)
+        if (err = copy(parameters, host, D2H, timers, *(*it)), err)
             break;
 
         listOfTimers.push_back(timers);
 
         if (++it == streamList.end())
             it = streamList.begin();
+    }
+
+    for (auto* stream : streamList)
+    {
+        delete stream;
     }
 
     return err;
@@ -712,17 +729,18 @@ int copy(const application::Parameters& parameters, T* host, T* D2H, application
         eventAttrib.message.ascii = __FUNCTION__ ":timerH2D ";
 
         nvtxRangePushEx(&eventAttrib);
-        cudaEventRecord(startH2D);
+        cudaEventRecord(startH2D, stream);
 
         //err = checkCuda(cudaMemcpy(dev, host, size * sizeof(T), cudaMemcpyHostToDevice))
         err = copyCUDA<T>(parameters, dev, host, cudaMemcpyHostToDevice, stream);
 
-        cudaEventRecord(stopH2D);
+        cudaEventRecord(stopH2D, stream);
         nvtxRangePop();
 
     }
 
     // <Launch a kernel on the GPU here>
+    addKernel<T> << <1, 1, 0, stream >> > (dev, size); // using thread, keep in mind to don't go over max cores.
 
     // Copy output vector from GPU buffer to host memory.
     if (!err)
@@ -736,11 +754,11 @@ int copy(const application::Parameters& parameters, T* host, T* D2H, application
         eventAttrib.message.ascii = __FUNCTION__ ":timerD2H ";
 
         nvtxRangePushEx(&eventAttrib);
-        cudaEventRecord(startD2H);
+        cudaEventRecord(startD2H, stream);
         //err = checkCuda(cudaMemcpy(D2H, dev, size * sizeof(T), cudaMemcpyDeviceToHost))
         err = copyCUDA(parameters, D2H, dev, cudaMemcpyDeviceToHost, stream);
 
-        cudaEventRecord(stopD2H);
+        cudaEventRecord(stopD2H, stream);
         nvtxRangePop();
 
     }
