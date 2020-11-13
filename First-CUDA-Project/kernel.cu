@@ -32,10 +32,12 @@ constexpr char KEY_DURATION_TYPE[] = "duration-type";
 constexpr char KEY_HEIGHT[] = "height";
 constexpr char KEY_HELP[] = "help";
 constexpr char KEY_KERNELS[] = "kernels";
+constexpr char KEY_NUM_BLOCKS[] = "num-blocks";
+constexpr char KEY_OUTPUT[] = "output";
 constexpr char KEY_STREAMS[] = "streams";
 constexpr char KEY_SHOW_DEVICES[] = "show-devices";
 constexpr char KEY_SHOW_PARAMETERS[] = "show-parameters";
-constexpr char KEY_OUTPUT[] = "output";
+constexpr char KEY_THREAD_PER_BLOCK[] = "thread-per-block";
 constexpr char KEY_TRANSFER[] = "transfer";
 constexpr char KEY_TYPE[] = "type";
 constexpr char KEY_WAIT_BEFORE_EXIT[] = "wait-before-exit";
@@ -44,10 +46,10 @@ constexpr char KEY_WIDTH[] = "width";
 // Convenience function for checking CUDA runtime API results
 // can be wrapped around any runtime API call. No-op in release builds.
 inline
-int checkCuda(cudaError_t result)
+int checkCuda(cudaError_t result, int index = -1)
 {
     if (result != cudaSuccess) {
-        std::cerr << "CUDA Runtime Error: " << cudaGetErrorString(result) << std::endl;
+        std::cerr << ((index > 0) ? "[" + std::to_string(index) + "] " : "") << "CUDA Runtime Error: " << cudaGetErrorString(result) << std::endl;
         return 1;
     }
 
@@ -187,7 +189,7 @@ namespace gv
                 std::cerr << "Invalid height option" << std::endl;
                 err = 1;
             }
-            else if (kernels_ < 1)
+            else if (kernels_ < 0)
             {
                 std::cerr << "Invalid kernel option" << std::endl;
                 err = 1;
@@ -249,6 +251,8 @@ namespace gv
 
                 kernels_ = result[KEY_KERNELS].as<int>();
 
+                numBlocks_ = result[KEY_NUM_BLOCKS].as<int>();
+
                 if (result.count(KEY_OUTPUT))
                 {
                     auto output = result[KEY_OUTPUT].as<std::string>();
@@ -260,6 +264,8 @@ namespace gv
                     auto streams = result[KEY_STREAMS].as<int>();
                     streams_ = streams;
                 }
+
+                threadsPerBlock_ = result[KEY_THREAD_PER_BLOCK].as<int>();
 
                 if (result.count(KEY_TRANSFER))
                 {
@@ -304,12 +310,20 @@ namespace gv
             return kernels_;
         }
 
+        int getNumBlocks() {
+            return numBlocks_;
+        }
+
         std::string getOutput() {
             return output_;
         }
 
         int getStreams() {
             return streams_;
+        }
+
+        int getThreadsPerBlock() {
+            return threadsPerBlock_;
         }
 
         Transfer getTransfer() {
@@ -337,8 +351,10 @@ namespace gv
             std::cout << "duration-type: " << string(durationType_) << std::endl;
             std::cout << "height: " << height_ << std::endl;
             std::cout << "kernels: " << kernels_ << std::endl;
+            std::cout << "numBlocks: " << numBlocks_ << std::endl;
             std::cout << "output: " << output_ << std::endl;
             std::cout << "streams: " << streams_ << std::endl;
+            std::cout << "threadsPerBlock: " << threadsPerBlock_ << std::endl;
             std::cout << "transfer: " << string(transfer_) << std::endl;
             std::cout << "numeric type: " << string(numericType_) << std::endl;
             std::cout << "width: " << width_ << std::endl;
@@ -392,8 +408,14 @@ namespace gv
             if (doc.HasMember(KEY_KERNELS) && doc[KEY_KERNELS].IsInt())
                 kernels_ = doc[KEY_KERNELS].GetInt();
 
+            if (doc.HasMember(KEY_NUM_BLOCKS) && doc[KEY_NUM_BLOCKS].IsInt())
+                numBlocks_ = doc[KEY_NUM_BLOCKS].GetInt();
+
             if (doc.HasMember(KEY_STREAMS) && doc[KEY_STREAMS].IsInt())
                 streams_ = doc[KEY_STREAMS].GetInt();
+
+            if (doc.HasMember(KEY_THREAD_PER_BLOCK) && doc[KEY_THREAD_PER_BLOCK].IsInt())
+                threadsPerBlock_ = doc[KEY_THREAD_PER_BLOCK].GetInt();
 
             if (doc.HasMember(KEY_TRANSFER) && doc[KEY_TRANSFER].IsString())
             {
@@ -452,8 +474,10 @@ namespace gv
         DurationType durationType_{ DurationType::Invalid };
         int height_{ -1 };
         int kernels_{ -1 };
+        int numBlocks_{ -1 };
         std::string output_{};
         int streams_{ -1 };
+        int threadsPerBlock_{ -1 };
         Transfer transfer_{ Transfer::Invalid };
         NumericType numericType_{ NumericType::Invalid };
         int width_{ -1 };
@@ -465,8 +489,25 @@ namespace gv
         template<class T>
         __global__ void addKernel(T* dev, int size)
         {
-            for (int i = 0; i < size; i++)
-                dev[i] += 1;
+            // built-in variables:
+            // `threadIdx` access thread ID.
+            // `blockIdx` access block index.
+            // `blockDim` dimension of thread block, i.e. number of thread within the block.
+            // `gridDim` dimension of the grid, i.e. number of blocks
+
+            int loopSize = size / gridDim.x;
+
+            int indexStart = loopSize * blockIdx.x * blockDim.x + threadIdx.x;
+            for (int index = indexStart; index < indexStart + loopSize; index++)
+            {
+                if (index > size - 1)
+                    break;
+                dev[index];
+            }
+
+            // old way:
+            //for (int i = 0; i < size; i++)
+            //    dev[i] += 1;
         }
 
         void showDevices() {
@@ -502,10 +543,12 @@ namespace gv
                 (KEY_DURATION_TYPE, "Possible value is counter or timer.", cxxopts::value<std::string>())
                 (KEY_HEIGHT, "Height of the array.", cxxopts::value<int>())
                 (KEY_KERNELS, "Number of kernels to apply.", cxxopts::value<int>()->default_value("1"))
+                (KEY_NUM_BLOCKS, "Number of blocks per kernel.", cxxopts::value<int>()->default_value("1"))
                 (KEY_OUTPUT, "Store to file instead of print to screen.", cxxopts::value<std::string>())
                 (KEY_SHOW_DEVICES, "Show devices available and exit.")
                 (KEY_SHOW_PARAMETERS, "Show parameters (if validation succeded) and exit.")
                 (KEY_STREAMS, "Number of streams.", cxxopts::value<int>()->default_value("1"))
+                (KEY_THREAD_PER_BLOCK, "Number of thread per block.", cxxopts::value<int>()->default_value("1"))
                 (KEY_TRANSFER, "Transfer memory mode. possible options are \"pageable\" and \"pinned\".", cxxopts::value<std::string>()->default_value("pageable"))
                 (KEY_WAIT_BEFORE_EXIT, "After process finished, it will be asked to press \"enter\" before returning to the command line.")
                 (KEY_TYPE, "Possible value is floating or integer.", cxxopts::value<std::string>())
@@ -544,11 +587,11 @@ namespace gv
             if (parameters.isAsync())
             {
 
-                err = checkCuda(cudaMemcpyAsync(dst, src, size * sizeof(T), cpyKind, stream));
+                err = checkCuda(cudaMemcpyAsync(dst, src, size * sizeof(T), cpyKind, stream), __LINE__);
             }
             else
             {
-                err = checkCuda(cudaMemcpy(dst, src, size * sizeof(T), cpyKind));
+                err = checkCuda(cudaMemcpy(dst, src, size * sizeof(T), cpyKind), __LINE__);
             }
 
             return err;
@@ -563,24 +606,26 @@ namespace gv
             const int deviceId = parameters.getDeviceId();
             const int height = parameters.getHeight();
             const int kernels = parameters.getKernels();
+            const int numBlocks = parameters.getNumBlocks();
+            const int threadsPerBlock = parameters.getThreadsPerBlock();
             const int width = parameters.getWidth();
             const int channels = parameters.getChannel();
             const int size = height * width * channels;
+            const int sharedMemSize = threadsPerBlock * sizeof(T);
             const uint32_t COLOR_GREEN = 0xFF00FF00;
 
-            if (checkCuda(cudaEventCreate(&timer->startH2D)))
+            if (checkCuda(cudaEventCreate(&timer->startH2D), __LINE__))
                 err = 1;
-            else if (checkCuda(cudaEventCreate(&timer->stopH2D)))
+            else if (checkCuda(cudaEventCreate(&timer->stopH2D), __LINE__))
                 err = 1;
-            else if (checkCuda(cudaEventCreate(&timer->startD2H)))
+            else if (checkCuda(cudaEventCreate(&timer->startD2H), __LINE__))
                 err = 1;
-            else if (checkCuda(cudaEventCreate(&timer->stopD2H)))
+            else if (checkCuda(cudaEventCreate(&timer->stopD2H), __LINE__))
                 err = 1;
-            else if (checkCuda(cudaSetDevice(deviceId))) // Choose which GPU to run on
+            else if (checkCuda(cudaMalloc((void**)&dev, size * sizeof(T)), __LINE__))
                 err = 1;
-            else if (checkCuda(cudaMalloc((void**)&dev, size * sizeof(T))))
-                err = 1;
-            else
+
+            if (!err)
             {
                 // Copy input vectors from host memory to GPU buffers.
                 eventAttrib = { 0 }; // zero the structure
@@ -591,26 +636,31 @@ namespace gv
                 eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
                 eventAttrib.message.ascii = __FUNCTION__ ":timerH2D ";
 
-                if (checkCuda(cudaEventRecord(timer->startH2D, stream)))
-                    err = 1;
-
-                if (copyCUDA<T>(parameters, dev, host, cudaMemcpyHostToDevice, stream))
-                    err = 1;
-
-                if (checkCuda(cudaEventRecord(timer->stopH2D, stream)))
-                    err = 1;
-
-                nvtxRangePop();
-
-                // <Launch a kernel on the GPU here>
-                for (int i = 0; i < kernels; i++)
-                    gv::cuda::addKernel<T> << <1, 1, 0, stream >> > (dev, size); // using thread, keep in mind to don't go over max cores.
+                nvtxRangePushEx(&eventAttrib);
             }
 
+            if (err)
+                err;
+            else if (checkCuda(cudaEventRecord(timer->startH2D, stream), __LINE__))
+                err = 1;
+            else if (copyCUDA<T>(parameters, dev, host, cudaMemcpyHostToDevice, stream))
+                err = 1;
+            else if (checkCuda(cudaEventRecord(timer->stopH2D, stream), __LINE__))
+                err = 1;
+            else
+                nvtxRangePop();
 
-            // Copy output vector from GPU buffer to host memory.
+
             if (!err)
             {
+                // <Launch a kernel on the GPU here>
+                for (int i = 0; i < kernels; i++)
+                    // each of `threadsPerBlock` executes `addKernel` 
+                    // There is a limit to the number of threads per block
+                    //  On current GPUs, a thread block may contain up to 1024 threads <- is this always true or could depend on the hardware ?
+                    gv::cuda::addKernel<T> <<<numBlocks, threadsPerBlock, 0, stream >>> (dev, size); // using thread, keep in mind to don't go over max cores.
+
+                // Copy output vector from GPU buffer to host memory.
                 eventAttrib = { 0 }; // zero the structure
                 eventAttrib.version = NVTX_VERSION;
                 eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
@@ -620,49 +670,18 @@ namespace gv
                 eventAttrib.message.ascii = __FUNCTION__ ":timerD2H ";
 
                 nvtxRangePushEx(&eventAttrib);
-                if (checkCuda(cudaEventRecord(timer->startD2H, stream)))
-                    err = 1;
+            }
 
-                err = copyCUDA(parameters, D2H, dev, cudaMemcpyDeviceToHost, stream);
-
-                if (checkCuda(cudaEventRecord(timer->stopD2H, stream)))
-                    err = 1;
+            if (err)
+                err;
+            else if (checkCuda(cudaEventRecord(timer->startD2H, stream), __LINE__))
+                err = 1;
+            else if (err = copyCUDA(parameters, D2H, dev, cudaMemcpyDeviceToHost, stream), err)
+                std::cerr << "error from copyCUDA" << std::endl;
+            else if (checkCuda(cudaEventRecord(timer->stopD2H, stream), __LINE__))
+                err = 1;
+            else
                 nvtxRangePop();
-
-            }
-
-            // XXX est-ce que les sync sont necessaires ?
-            // Synchronize CUDA events and get timers
-            if (!err)
-            {
-                //cudaEventSynchronize(stopH2D); //put that in a thread ??
-                //cudaEventSynchronize(stopD2H);
-
-                if (checkCuda(cudaEventSynchronize(timer->startH2D)))
-                {
-                    std::cout << "X11" << std::endl;
-                    err = 1;
-                }
-
-                if (checkCuda(cudaEventSynchronize(timer->startD2H)))
-                {
-                    std::cout << "X12" << std::endl;
-                    err = 1;
-                }
-
-                if (checkCuda(cudaEventSynchronize(timer->stopH2D)))
-                {
-                    std::cout << "X13" << std::endl;
-                    err = 1;
-                }
-
-                if (checkCuda(cudaEventSynchronize(timer->stopD2H)))
-                {
-                    std::cout << "X14" << std::endl;
-                    err = 1;
-                }
-
-            }
 
             return err;
         }
@@ -697,10 +716,12 @@ namespace gv
                     it = streamList.begin();
             }
 
-            for (auto* stream : streamList)
+            if (!err) {
+                for (auto* stream : streamList)
                 cudaStreamSynchronize(*stream);
 
-            gv::timers.synchronizeAll();
+                gv::timers.synchronizeAll();
+            }
 
             for (auto* stream : streamList)
                 delete stream;
@@ -715,13 +736,13 @@ namespace gv
             const int streams = parameters.getStreams();
             int err = 0;
 
-            std::list<cudaStream_t> streamList{};
+            std::list<cudaStream_t*> streamList{};
 
             for (int i = 0; i < streams; i++)
             {
-                streamList.push_back({});
-                cudaStream_t stream = *streamList.end();
-                cudaStreamCreate(&stream);
+                auto stream = new cudaStream_t();
+                cudaStreamCreate(stream);
+                streamList.push_back(stream);
             };
 
             auto start = std::chrono::system_clock::now();
@@ -731,7 +752,7 @@ namespace gv
             {
                 auto timer = new gv::Timer();
 
-                if (err = gv::app::copy(parameters, host, D2H, timer, *it), err)
+                if (err = gv::app::copy(parameters, host, D2H, timer, *(*it)), err)
                     break;
 
                 gv::timers.pushBack(timer);
@@ -741,6 +762,16 @@ namespace gv
 
                 end = std::chrono::system_clock::now();
             }
+
+            if (!err) {
+                for (auto* stream : streamList)
+                    cudaStreamSynchronize(*stream);
+
+                gv::timers.synchronizeAll();
+            }
+
+            for (auto* stream : streamList)
+                delete stream;
 
             return err;
         }
@@ -768,11 +799,11 @@ namespace gv
             }
             case gv::Parameters::Transfer::Pinned:
             {
-                if (err = checkCuda(cudaMallocHost((T**)&host, size * sizeof(T))), err)
+                if (err = checkCuda(cudaMallocHost((T**)&host, size * sizeof(T)), __LINE__), err)
                 {
                     break;
                 }
-                else if (err = checkCuda(cudaMallocHost((T**)&D2H, size * sizeof(T))), err)
+                else if (err = checkCuda(cudaMallocHost((T**)&D2H, size * sizeof(T)), __LINE__), err)
                 {
                     break;
                 }
@@ -856,7 +887,7 @@ namespace gv
             // cudaDeviceReset must be called before exiting in order for profiling and
             // tracing tools such as Nsight and Visual Profiler to show complete traces.
 
-            err = checkCuda(cudaDeviceReset());
+            err = checkCuda(cudaDeviceReset(), __LINE__);
 
             return err;
         }
@@ -880,6 +911,8 @@ int main(int argc, char** argv)
         std::cerr << "(EE) validate -> error" << std::endl;
     else if (gv::app::result.count(KEY_SHOW_PARAMETERS))
         parameters.printParameters();
+    else if (err = checkCuda(cudaSetDevice(parameters.getDeviceId()), __LINE__), err) // Choose which GPU to run on
+        std::cerr << "(EE) cudaSetDevice -> error" << std::endl;
     else if (err = gv::app::process(parameters), err)
         std::cerr << "(EE) process -> error" << std::endl;
     else if (gv::app::result.count(KEY_OUTPUT))
